@@ -297,23 +297,23 @@ loginctl show-user <user> -p Linger
 
 ```mermaid
 flowchart TD
-  A[Developer Laptop / WSL<br/>~/projects/&lt;app&gt;] -->|1. Build image<br/>podman/docker build| B[Local Image<br/>local/&lt;app&gt;:&lt;tag&gt;]
-  B -->|2. Export single archive<br/>podman save --format oci-archive<br/>or docker save| C[/tmp/&lt;app&gt;_&lt;tag&gt;_&lt;ts&gt;.image.tar<br/>+ .sha256]
-  C -->|3. Transfer (resumable)<br/>rsync -avP --inplace<br/>or scp fallback<br/>SSH keepalives + retries| D[Air-gapped RHEL9 Host<br/>/home/&lt;user&gt;/node/&lt;app&gt;/]
-  D -->|4. Verify checksum<br/>sha256sum -c| E{Checksum OK?}
-  E -->|No| X[Fail deploy<br/>Re-transfer archive]
-  E -->|Yes| F[5. Verify tar readable<br/>tar -tf (EOF detection)]
-  F -->|6. podman load -i| G[Remote Image Store<br/>(rootless: ~/.local/share/containers)]
-  G -->|7. Stop old container<br/>podman rm -f &lt;app&gt;| H[Run new container<br/>podman run -d ...]
-  H -->|8. Verify running<br/>podman ps| I{Running?}
-  I -->|No + rollback enabled| J[Rollback<br/>re-run with previous image ID]
-  I -->|Yes| K{--use-systemd?}
-  K -->|No| Z[Done]
-  K -->|Yes| L{Scope auto/user/system}
-  L -->|user (rootless)| M[Install user unit<br/>~/.config/systemd/user/<br/>systemctl --user enable --now]
-  L -->|system (rootful)| N[Install system unit<br/>/etc/systemd/system/<br/>sudo systemctl enable --now]
-  M --> O[Prune archives/images<br/>(optional)]
+  A["Developer Laptop / WSL\n~/projects/<app>"] -->|"1. Build image\npodman or docker build"| B["Local Image\nlocal/<app>:<tag>"]
+  B -->|"2. Export single archive\npodman save (oci-archive)\nor docker save"| C["Archive file\n/tmp/<app>_<tag>_<ts>.image.tar\nand checksum .sha256"]
+  C -->|"3. Transfer\nrsync (preferred) or scp\nSSH keepalives and retries"| D["Air-gapped RHEL9 Host\n/home/<user>/node/<app>/"]
+  D -->|"4. Verify checksum\nsha256sum -c"| E{"Checksum OK?"}
+  E -->|"No"| X["Fail deployment\nRe-transfer archive"]
+  E -->|"Yes"| F["5. Verify tar\ntar -tf (EOF detection)"]
+  F -->|"6. Load image\npodman load -i"| G["Remote Image Store\n(rootless storage in home dir)"]
+  G -->|"7. Remove old container\npodman rm -f <app>"| H["8. Run new container\npodman run -d ..."]
+  H -->|"9. Verify running\npodman ps"| I{"Running?"}
+  I -->|"No and rollback enabled"| J["Rollback\nre-run using previous image ID"]
+  I -->|"Yes"| K{"Use systemd?"}
+  K -->|"No"| Z["Done"]
+  K -->|"Yes"| L{"Systemd scope"}
+  L -->|"user (rootless)"| M["Install user unit\n~/.config/systemd/user/\nsystemctl --user enable --now"]
+  L -->|"system (rootful)"| N["Install system unit\n/etc/systemd/system/\nsudo systemctl enable --now"]
+  M --> O["Prune archives and images (optional)"]
   N --> O
-  O --> Z[Done]
+  O --> Z
 ```
 
