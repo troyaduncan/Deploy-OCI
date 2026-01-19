@@ -2,78 +2,59 @@
 set -euo pipefail
 
 # deploy-oci.sh
-# Comprehensive OCI-image deployment for Node.js apps to air-gapped RHEL9 using remote Podman.
 #
-# Features:
-# - Build locally (podman/docker), export as single archive (podman: oci-archive; docker: docker-archive)
-# - Transfer reliably (rsync resumable preferred; scp fallback), with SSH keepalives + retries
-# - Remote integrity checks: sha256sum -c + tar -tf (catches truncated archives / "unexpected EOF")
-# - Remote podman load + image confirmation
-# - (Re)run container with port mapping, restart policy, optional env-file
-# - Optional systemd unit install + enable (user/system scope, auto-detect rootless)
-# - Optional pruning: keep last N archives, prune old unused images for the app
-# - Optional rollback: if new container fails to start, auto-recreate container using previous image ID
-# - Dry-run / confirmation prompt
+# Build an image locally (podman/docker), export as a single archive, transfer to a remote (air-gapped) RHEL host,
+# verify integrity, podman load, restart container, optional systemd integration (user/system), rollback, and pruning.
 #
-# Systemd modes:
-# - Rootless podman: use user services (systemctl --user) + ~/.config/systemd/user; recommend linger
-# - Rootful  podman: use system services (sudo systemctl) + /etc/systemd/system
-#
-# Layout assumptions:
-# - Local apps in ~/projects/<app> (override with --projects-dir)
-# - Remote base dir /home/<user>/node/<app> (override with --remote-dir)
+# Highlights
+# - Creates a default Containerfile if neither Containerfile nor Dockerfile exists (default CMD: npm start)
+# - SSH keepalives + retries; rsync resumable preferred; scp fallback
+# - Remote integrity checks: sha256sum -c and tar -tf (catches truncated archives / unexpected EOF)
+# - Auto-detects remote podman rootless and chooses systemd scope (user/system) when --systemd-scope auto
+# - Optional: enable linger for user services (rootless) with --enable-linger
+# - Optional rollback to previous container image ID with --rollback
+# - Optional pruning of old remote archives and unused images
 
 usage() {
   cat <<'EOF'
 Usage:
-  deploy-oci.sh \
-    --app <appName> \
-    --host <hostname-or-ip> \
-    [--remote-user <user>] \
-    [--projects-dir <localProjectsDir>] \
-    [--remote-dir <remoteBaseDir>] \
-    [--port <hostPort:containerPort>] \
-    [--env-file <pathOnRemote>] \
-    [--engine <podman|docker>] \
-    [--tag <tag>] \
-    [--use-systemd] \
-    [--systemd-scope <auto|user|system>] \
-    [--enable-linger] \
-    [--restart-policy <policy>] \
-    [--ssh-port <port>] \
-    [--ssh-keepalive <seconds>] \
-    [--ssh-keepalive-count <count>] \
-    [--transfer <rsync|scp>] \
-    [--retries <N>] \
-    [--keep-archives <N>] \
-    [--keep-images <N>] \
-    [--rollback] \
-    [--dry-run] \
-    [--yes]
+  deploy-oci.sh --app <appName> --host <hostname-or-ip> [options]
+
+Required:
+  --app <name>                 App directory name under --projects-dir
+  --host <host>                Target host (DNS or IP)
+
+Common options:
+  --remote-user <user>         SSH user on target (default: adm_tduncan28)
+  --projects-dir <dir>         Local base dir (default: ~/projects)
+  --remote-dir <dir>           Remote base dir (default: /home/<remote-user>/node)
+  --port <host:container>      Port mapping (default: 8080:8080)
+  --env-file <remote path>     Remote env file for podman run (optional)
+  --engine <podman|docker>     Local build engine (default: podman)
+  --tag <tag>                  Image tag (default: latest)
+  --yes                        Skip confirmation prompt
+  --dry-run                    Print what would happen (no changes)
 
 Systemd:
-  --use-systemd            Install and enable a unit for the container.
-  --systemd-scope auto     (default) auto-detect rootless and choose user/system accordingly.
-  --systemd-scope user     Use user services (~/.config/systemd/user, systemctl --user). Recommended for rootless.
-  --systemd-scope system   Use system services (/etc/systemd/system, sudo systemctl). Use for rootful.
-  --enable-linger          If using user services, enable linger when it's disabled (requires sudo).
+  --use-systemd
+  --systemd-scope <auto|user|system>   default: auto
+  --enable-linger                      If user scope and linger is disabled, run sudo loginctl enable-linger
 
-Pruning:
-  --keep-archives N   Keep only the newest N image archives in the remote app dir (default: 5; set 0 to disable).
-  --keep-images N     Best-effort: keep only newest N images for this app repo on remote (default: 3; set 0 to disable).
+Rollback & pruning:
+  --rollback
+  --keep-archives <N>          Keep newest N archives on remote (default: 5; 0 disables)
+  --keep-images <N>            Keep newest N images for local/<app> on remote (default: 3; 0 disables)
 
-Reliability:
-  --transfer rsync|scp  Prefer rsync (resumable). If rsync is missing, scp is used.
-  SSH keepalives are applied to ssh/scp/rsync.
+Transfer/SSH:
+  --transfer <rsync|scp>       default: rsync (falls back to scp if rsync missing)
+  --retries <N>                default: 2
+  --ssh-port <port>            default: 22
+  --ssh-keepalive <sec>        default: 20
+  --ssh-keepalive-count <N>    default: 6
 
 Examples:
-  deploy-oci.sh --app Team-Nexus --host dblvlecdd0000a --remote-user adm_tduncan28 --port 8080:8080 --use-systemd
-
-  # Force user services & enable linger:
-  deploy-oci.sh --app ecm_demoapp2 --host dblvlecdd0000a --remote-user adm_tduncan28 --use-systemd --systemd-scope user --enable-linger
-
-  # Rootful host using system services:
-  deploy-oci.sh --app api --host rhel9host --remote-user svc_user --use-systemd --systemd-scope system
+  deploy-oci.sh --app Team-Nexus --host dblvlecdd0000a --use-systemd --enable-linger --yes
+  deploy-oci.sh --app api --host rhel9 --systemd-scope system --use-systemd
 EOF
 }
 
@@ -84,24 +65,24 @@ APP=""
 HOST=""
 REMOTE_USER="adm_tduncan28"
 PROJECTS_DIR="${HOME}/projects"
-REMOTE_DIR="/home/adm_tduncan28/node"
-
-PORT_MAP="8080:8080"          # host:container
-ENV_FILE=""                   # remote env file path (optional)
-
-ENGINE="podman"               # local build engine: podman or docker
+REMOTE_DIR=""                 # default set later based on REMOTE_USER
+PORT_MAP="8080:8080"
+ENV_FILE=""
+ENGINE="podman"
 TAG="latest"
+
 USE_SYSTEMD="false"
 SYSTEMD_SCOPE="auto"          # auto|user|system
-ENABLE_LINGER="false"         # only relevant for user scope
-RESTART_POLICY="always"       # always, on-failure, etc.
+ENABLE_LINGER="false"
+
+RESTART_POLICY="always"
+
+TRANSFER="rsync"
+RETRIES="2"
 
 SSH_PORT="22"
 SSH_KEEPALIVE="20"
 SSH_KEEPALIVE_COUNT="6"
-
-TRANSFER="rsync"              # rsync recommended (resumable). falls back to scp automatically if rsync missing.
-RETRIES="2"
 
 KEEP_ARCHIVES="5"
 KEEP_IMAGES="3"
@@ -124,20 +105,27 @@ while [[ $# -gt 0 ]]; do
     --env-file) ENV_FILE="$2"; shift 2;;
     --engine) ENGINE="$2"; shift 2;;
     --tag) TAG="$2"; shift 2;;
+
     --use-systemd) USE_SYSTEMD="true"; shift 1;;
     --systemd-scope) SYSTEMD_SCOPE="$2"; shift 2;;
     --enable-linger) ENABLE_LINGER="true"; shift 1;;
+
     --restart-policy) RESTART_POLICY="$2"; shift 2;;
+
+    --transfer) TRANSFER="$2"; shift 2;;
+    --retries) RETRIES="$2"; shift 2;;
+
     --ssh-port) SSH_PORT="$2"; shift 2;;
     --ssh-keepalive) SSH_KEEPALIVE="$2"; shift 2;;
     --ssh-keepalive-count) SSH_KEEPALIVE_COUNT="$2"; shift 2;;
-    --transfer) TRANSFER="$2"; shift 2;;
-    --retries) RETRIES="$2"; shift 2;;
+
     --keep-archives) KEEP_ARCHIVES="$2"; shift 2;;
     --keep-images) KEEP_IMAGES="$2"; shift 2;;
     --rollback) DO_ROLLBACK="true"; shift 1;;
+
     --dry-run) DRY_RUN="true"; shift 1;;
     --yes) ASSUME_YES="true"; shift 1;;
+
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 1;;
   esac
@@ -149,6 +137,10 @@ if [[ -z "$APP" || -z "$HOST" ]]; then
   exit 1
 fi
 
+if [[ -z "$REMOTE_DIR" ]]; then
+  REMOTE_DIR="/home/${REMOTE_USER}/node"
+fi
+
 LOCAL_APP_DIR="${PROJECTS_DIR}/${APP}"
 if [[ ! -d "$LOCAL_APP_DIR" ]]; then
   echo "ERROR: Local app directory not found: $LOCAL_APP_DIR"
@@ -156,11 +148,9 @@ if [[ ! -d "$LOCAL_APP_DIR" ]]; then
 fi
 
 if ! command -v "$ENGINE" >/dev/null 2>&1; then
-  echo "ERROR: Local engine '$ENGINE' not found. Install podman or docker on your WSL machine."
+  echo "ERROR: Local engine '$ENGINE' not found. Install podman or docker on your local machine."
   exit 1
 fi
-
-REMOTE_ENGINE="podman"
 
 # -------------------------
 # Helpers
@@ -195,7 +185,6 @@ ssh_run() {
 have_rsync() { command -v rsync >/dev/null 2>&1; }
 
 transfer_file() {
-  # Usage: transfer_file <local_path> <remote_dir>
   local local_path="$1"
   local remote_dir="$2"
 
@@ -205,13 +194,11 @@ transfer_file() {
   fi
 
   if [[ "$TRANSFER" == "rsync" ]] && have_rsync; then
-    rsync -avP --inplace \
-      -e "ssh ${SSH_OPTS[*]}" \
+    rsync -avP --inplace -e "ssh ${SSH_OPTS[*]}" \
       "$local_path" "${REMOTE_USER}@${HOST}:${remote_dir}/"
   else
-    # scp destination must NOT include quotes
-    scp "${SSH_OPTS[@]}" -p \
-      "$local_path" "${REMOTE_USER}@${HOST}:${remote_dir}/"
+    # IMPORTANT: no quotes in scp destination path
+    scp "${SSH_OPTS[@]}" -p "$local_path" "${REMOTE_USER}@${HOST}:${remote_dir}/"
   fi
 }
 
@@ -243,8 +230,41 @@ confirm_or_exit() {
   esac
 }
 
+create_default_containerfile_if_missing() {
+  local app_dir="$1"
+
+  if [[ -f "${app_dir}/Containerfile" || -f "${app_dir}/Dockerfile" ]]; then
+    return 0
+  fi
+
+  local cf="${app_dir}/Containerfile"
+  echo "==> No Containerfile/Dockerfile found. Creating a default Containerfile at: $cf"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] create default Containerfile (UBI9 nodejs-20 base, EXPOSE 8080, CMD npm start)"
+    return 0
+  fi
+
+  cat > "$cf" <<'EOF'
+# Default Containerfile generated by deploy-oci.sh
+FROM registry.access.redhat.com/ubi9/nodejs-20:latest
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+
+COPY . .
+ENV NODE_ENV=production
+EXPOSE 8080
+
+CMD ["npm", "start"]
+EOF
+
+  echo "==> Created default Containerfile. Review CMD/EXPOSE if needed."
+}
+
 # -------------------------
-# Plan / summary
+# Plan
 # -------------------------
 IMAGE="local/${APP}:${TAG}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -287,17 +307,22 @@ confirm_or_exit
 # -------------------------
 # Build + export
 # -------------------------
-echo "==> Building image locally..."
+echo "==> Preparing build context..."
+create_default_containerfile_if_missing "$LOCAL_APP_DIR"
+
 cd "$LOCAL_APP_DIR"
 
 BUILD_FILE=""
-if [[ -f "Containerfile" ]]; then BUILD_FILE="Containerfile"; fi
-if [[ -z "$BUILD_FILE" && -f "Dockerfile" ]]; then BUILD_FILE="Dockerfile"; fi
-if [[ -z "$BUILD_FILE" ]]; then
-  echo "ERROR: No Containerfile or Dockerfile found in $LOCAL_APP_DIR"
+if [[ -f "Containerfile" ]]; then
+  BUILD_FILE="Containerfile"
+elif [[ -f "Dockerfile" ]]; then
+  BUILD_FILE="Dockerfile"
+else
+  echo "ERROR: Still no Containerfile/Dockerfile found (unexpected)."
   exit 1
 fi
 
+echo "==> Building image locally..."
 run_local "$ENGINE" build -f "$BUILD_FILE" -t "$IMAGE" .
 
 echo "==> Exporting image archive to $LOCAL_ARCHIVE"
@@ -313,8 +338,7 @@ echo "==> Local integrity checks..."
 run_local tar -tf "$LOCAL_ARCHIVE" >/dev/null
 if [[ "$DRY_RUN" != "true" ]]; then
   sha256sum "$LOCAL_ARCHIVE" > "$LOCAL_SHA"
-  LOCAL_SHA_VAL="$(cut -d' ' -f1 < "$LOCAL_SHA")"
-  echo "    sha256: $LOCAL_SHA_VAL"
+  echo "    sha256: $(cut -d' ' -f1 < "$LOCAL_SHA")"
 else
   echo "    [dry-run] sha256sum $LOCAL_ARCHIVE > $LOCAL_SHA"
 fi
@@ -338,13 +362,14 @@ ssh_run "cd '$REMOTE_APP_DIR' && tar -tf '$(basename "$REMOTE_ARCHIVE")' >/dev/n
 # -------------------------
 # Load + confirm image on remote
 # -------------------------
+REMOTE_ENGINE="podman"
 echo "==> Loading image into remote podman..."
 LOAD_OUT=""
 if [[ "$DRY_RUN" == "true" ]]; then
-  echo "[dry-run] ssh ${REMOTE_USER}@${HOST} cd '$REMOTE_APP_DIR' && $REMOTE_ENGINE load -i '$(basename "$REMOTE_ARCHIVE")'"
-  LOAD_OUT="Loaded image(s): $IMAGE"
+  echo "[dry-run] ssh ${REMOTE_USER}@${HOST} cd '$REMOTE_APP_DIR' && ${REMOTE_ENGINE} load -i '$(basename "$REMOTE_ARCHIVE")'"
+  LOAD_OUT="Loaded image(s): ${IMAGE}"
 else
-  LOAD_OUT="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "cd '$REMOTE_APP_DIR' && $REMOTE_ENGINE load -i '$(basename "$REMOTE_ARCHIVE")'")"
+  LOAD_OUT="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "cd '$REMOTE_APP_DIR' && ${REMOTE_ENGINE} load -i '$(basename "$REMOTE_ARCHIVE")'")"
   echo "$LOAD_OUT"
 fi
 
@@ -354,16 +379,16 @@ if [[ -z "$LOADED_REF" ]]; then
 fi
 
 echo "==> Confirming image exists on remote: $LOADED_REF"
-ssh_run "$REMOTE_ENGINE images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep -F \"$LOADED_REF\""
+ssh_run "${REMOTE_ENGINE} images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep -F \"$LOADED_REF\""
 
 # -------------------------
-# Auto-detect remote rootless (for systemd)
+# Determine remote rootless + effective systemd scope
 # -------------------------
 REMOTE_ROOTLESS="unknown"
 if [[ "$DRY_RUN" == "true" ]]; then
-  REMOTE_ROOTLESS="true"  # assume typical for plan output
+  REMOTE_ROOTLESS="true"
 else
-  REMOTE_ROOTLESS="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "$REMOTE_ENGINE info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo unknown")"
+  REMOTE_ROOTLESS="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "${REMOTE_ENGINE} info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo unknown")"
 fi
 
 EFFECTIVE_SCOPE="$SYSTEMD_SCOPE"
@@ -379,16 +404,13 @@ echo "==> Remote podman rootless: $REMOTE_ROOTLESS"
 echo "==> Effective systemd scope: $EFFECTIVE_SCOPE"
 
 # -------------------------
-# Rollback preparation: capture previous image ID (if container exists)
+# Rollback: capture previous container image ID
 # -------------------------
 echo "==> Capturing previous container image (for rollback, if enabled)..."
 OLD_IMAGE_ID=""
-if [[ "$DRY_RUN" == "true" ]]; then
-  OLD_IMAGE_ID="(dry-run-old-image-id)"
-else
-  OLD_IMAGE_ID="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "$REMOTE_ENGINE inspect -f '{{.Image}}' '$CONTAINER_NAME' 2>/dev/null || true")"
+if [[ "$DRY_RUN" != "true" ]]; then
+  OLD_IMAGE_ID="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "${REMOTE_ENGINE} inspect -f '{{.Image}}' '$CONTAINER_NAME' 2>/dev/null || true")"
 fi
-
 if [[ -n "$OLD_IMAGE_ID" ]]; then
   echo "    previous image ID: $OLD_IMAGE_ID"
 else
@@ -399,13 +421,13 @@ fi
 # (Re)run container
 # -------------------------
 echo "==> Stopping/removing existing container (if any): $CONTAINER_NAME"
-ssh_run "$REMOTE_ENGINE rm -f '$CONTAINER_NAME' >/dev/null 2>&1 || true"
+ssh_run "${REMOTE_ENGINE} rm -f '$CONTAINER_NAME' >/dev/null 2>&1 || true"
 
-RUN_CMD="$REMOTE_ENGINE run -d --name '$CONTAINER_NAME' -p '${PORT_HOST}:${PORT_CONT}' --restart=${RESTART_POLICY}"
+RUN_CMD="${REMOTE_ENGINE} run -d --name '$CONTAINER_NAME' -p '${PORT_HOST}:${PORT_CONT}' --restart=${RESTART_POLICY}"
 if [[ -n "$ENV_FILE" ]]; then
-  RUN_CMD="$RUN_CMD --env-file '$ENV_FILE'"
+  RUN_CMD="${RUN_CMD} --env-file '$ENV_FILE'"
 fi
-RUN_CMD="$RUN_CMD '$LOADED_REF'"
+RUN_CMD="${RUN_CMD} '$LOADED_REF'"
 
 echo "==> Starting container..."
 echo "    $RUN_CMD"
@@ -420,9 +442,11 @@ fi
 
 echo "==> Verifying container is running..."
 if [[ "$DRY_RUN" == "true" ]]; then
-  echo "[dry-run] ssh ${REMOTE_USER}@${HOST} podman ps --filter name='^${CONTAINER_NAME}$'"
+  echo "[dry-run] ssh ${REMOTE_USER}@${HOST} ${REMOTE_ENGINE} ps --filter name='^${CONTAINER_NAME}$'"
 else
-  if ! ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "$REMOTE_ENGINE ps --filter name='^${CONTAINER_NAME}$' --format '{{.Names}} {{.Status}}' | grep -q \"^${CONTAINER_NAME} \"; then
+  if ! ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" \
+    "${REMOTE_ENGINE} ps --filter name='^${CONTAINER_NAME}$' --format '{{.Names}} {{.Status}}'" \
+    | grep -q "^${CONTAINER_NAME} "; then
     START_OK="false"
   fi
 fi
@@ -431,61 +455,66 @@ if [[ "$START_OK" != "true" ]]; then
   echo "ERROR: New container did not start cleanly."
   if [[ "$DO_ROLLBACK" == "true" && -n "$OLD_IMAGE_ID" ]]; then
     echo "==> Attempting rollback to previous image ID: $OLD_IMAGE_ID"
-    ssh_run "$REMOTE_ENGINE rm -f '$CONTAINER_NAME' >/dev/null 2>&1 || true"
-    RB_CMD="$REMOTE_ENGINE run -d --name '$CONTAINER_NAME' -p '${PORT_HOST}:${PORT_CONT}' --restart=${RESTART_POLICY}"
+    ssh_run "${REMOTE_ENGINE} rm -f '$CONTAINER_NAME' >/dev/null 2>&1 || true"
+
+    RB_CMD="${REMOTE_ENGINE} run -d --name '$CONTAINER_NAME' -p '${PORT_HOST}:${PORT_CONT}' --restart=${RESTART_POLICY}"
     if [[ -n "$ENV_FILE" ]]; then
-      RB_CMD="$RB_CMD --env-file '$ENV_FILE'"
+      RB_CMD="${RB_CMD} --env-file '$ENV_FILE'"
     fi
-    RB_CMD="$RB_CMD '$OLD_IMAGE_ID'"
+    RB_CMD="${RB_CMD} '$OLD_IMAGE_ID'"
+
     echo "    $RB_CMD"
     ssh_run "$RB_CMD"
+
     echo "==> Rollback container status:"
-    ssh_run "$REMOTE_ENGINE ps --filter name='^${CONTAINER_NAME}$' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'"
+    ssh_run "${REMOTE_ENGINE} ps --filter name='^${CONTAINER_NAME}$' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'"
+
     echo "Rollback attempted. Check logs:"
-    echo "  ssh ${REMOTE_USER}@${HOST} \"$REMOTE_ENGINE logs --tail 200 $CONTAINER_NAME\""
+    echo "  ssh ${REMOTE_USER}@${HOST} \"${REMOTE_ENGINE} logs --tail 200 ${CONTAINER_NAME}\""
     exit 1
   else
     echo "No rollback performed (either --rollback not set or no prior container image available)."
     echo "Check logs:"
-    echo "  ssh ${REMOTE_USER}@${HOST} \"$REMOTE_ENGINE logs --tail 200 $CONTAINER_NAME\""
+    echo "  ssh ${REMOTE_USER}@${HOST} \"${REMOTE_ENGINE} logs --tail 200 ${CONTAINER_NAME}\""
     exit 1
   fi
 fi
 
 echo "==> Container status (brief):"
-ssh_run "$REMOTE_ENGINE ps --filter name='^${CONTAINER_NAME}$' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'"
+ssh_run "${REMOTE_ENGINE} ps --filter name='^${CONTAINER_NAME}$' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'"
 
 # -------------------------
-# systemd setup (user/system)
+# systemd setup
 # -------------------------
 if [[ "$USE_SYSTEMD" == "true" ]]; then
   if [[ "$EFFECTIVE_SCOPE" == "user" ]]; then
     echo "==> Setting up USER systemd service (rootless-friendly)..."
-    # Check linger and optionally enable it
+
     if [[ "$DRY_RUN" == "true" ]]; then
-      echo "[dry-run] ssh ${REMOTE_USER}@${HOST} loginctl show-user '$REMOTE_USER' -p Linger"
-      echo "[dry-run] (if needed) sudo loginctl enable-linger '$REMOTE_USER'  # only if --enable-linger"
+      echo "[dry-run] ssh ${REMOTE_USER}@${HOST} loginctl show-user '${REMOTE_USER}' -p Linger"
+      if [[ "$ENABLE_LINGER" == "true" ]]; then
+        echo "[dry-run] ssh ${REMOTE_USER}@${HOST} sudo loginctl enable-linger '${REMOTE_USER}'"
+      fi
     else
-      LINGER_LINE="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "loginctl show-user '$REMOTE_USER' -p Linger 2>/dev/null || true")"
-      echo "    $LINGER_LINE"
+      LINGER_LINE="$(ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "loginctl show-user '${REMOTE_USER}' -p Linger 2>/dev/null || true")"
+      echo "    ${LINGER_LINE:-Linger=unknown}"
       if echo "$LINGER_LINE" | grep -q "Linger=no"; then
         if [[ "$ENABLE_LINGER" == "true" ]]; then
-          echo "    Enabling linger for $REMOTE_USER (sudo)..."
-          ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "sudo loginctl enable-linger '$REMOTE_USER'"
-          ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "loginctl show-user '$REMOTE_USER' -p Linger"
+          echo "    Enabling linger for ${REMOTE_USER} (sudo)..."
+          ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "sudo loginctl enable-linger '${REMOTE_USER}'"
+          ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${HOST}" "loginctl show-user '${REMOTE_USER}' -p Linger"
         else
-          echo "WARN: Linger is disabled. For auto-start at boot without login, run:"
-          echo "      sudo loginctl enable-linger $REMOTE_USER"
+          echo "WARN: Linger is disabled. For boot-time start without login, run:"
+          echo "      sudo loginctl enable-linger ${REMOTE_USER}"
         fi
       fi
     fi
 
-    # Install unit to ~/.config/systemd/user and enable via systemctl --user
     ssh_run "
       set -euo pipefail
       mkdir -p \"\$HOME/.config/systemd/user\"
       cd \"\$HOME/.config/systemd/user\"
-      $REMOTE_ENGINE generate systemd --name '$CONTAINER_NAME' --files --new >/dev/null
+      ${REMOTE_ENGINE} generate systemd --name '${CONTAINER_NAME}' --files --new >/dev/null
       systemctl --user daemon-reload
       systemctl --user enable --now \"container-${CONTAINER_NAME}.service\"
       systemctl --user --no-pager -l status \"container-${CONTAINER_NAME}.service\" | sed -n '1,14p'
@@ -494,12 +523,12 @@ if [[ "$USE_SYSTEMD" == "true" ]]; then
     echo "==> Setting up SYSTEM systemd service (rootful)..."
     ssh_run "
       set -euo pipefail
-      mkdir -p '$REMOTE_APP_DIR/systemd'
-      cd '$REMOTE_APP_DIR/systemd'
-      $REMOTE_ENGINE generate systemd --name '$CONTAINER_NAME' --files --new >/dev/null
+      mkdir -p '${REMOTE_APP_DIR}/systemd'
+      cd '${REMOTE_APP_DIR}/systemd'
+      ${REMOTE_ENGINE} generate systemd --name '${CONTAINER_NAME}' --files --new >/dev/null
       UNIT_FILE=\$(ls -1 container-${CONTAINER_NAME}.service | head -n 1)
-      echo \"Generated unit: \$UNIT_FILE\"
-      sudo mv \"\$UNIT_FILE\" /etc/systemd/system/
+      echo \"Generated unit: \${UNIT_FILE}\"
+      sudo mv \"\${UNIT_FILE}\" /etc/systemd/system/
       sudo systemctl daemon-reload
       sudo systemctl enable --now \"container-${CONTAINER_NAME}.service\"
       sudo systemctl --no-pager -l status \"container-${CONTAINER_NAME}.service\" | sed -n '1,14p'
@@ -513,10 +542,10 @@ fi
 # Pruning
 # -------------------------
 if [[ "$KEEP_ARCHIVES" != "0" ]]; then
-  echo "==> Pruning remote archives (keep newest $KEEP_ARCHIVES)..."
+  echo "==> Pruning remote archives (keep newest ${KEEP_ARCHIVES})..."
   ssh_run "
     set -euo pipefail
-    cd '$REMOTE_APP_DIR'
+    cd '${REMOTE_APP_DIR}'
     ls -1t *.image.tar 2>/dev/null | tail -n +$((KEEP_ARCHIVES+1)) | xargs -r rm -f
     ls -1t *.image.tar.sha256 2>/dev/null | tail -n +$((KEEP_ARCHIVES+1)) | xargs -r rm -f
   "
@@ -525,20 +554,20 @@ else
 fi
 
 if [[ "$KEEP_IMAGES" != "0" ]]; then
-  echo "==> Pruning remote images (best-effort, keep newest $KEEP_IMAGES for repo local/$APP)..."
+  echo "==> Pruning remote images (best-effort, keep newest ${KEEP_IMAGES} for repo local/${APP})..."
   ssh_run "
     set -euo pipefail
-    CUR_ID=\$($REMOTE_ENGINE inspect -f '{{.Image}}' '$CONTAINER_NAME' 2>/dev/null || true)
+    CUR_ID=\$(${REMOTE_ENGINE} inspect -f '{{.Image}}' '${CONTAINER_NAME}' 2>/dev/null || true)
     OLD_ID='${OLD_IMAGE_ID}'
-    $REMOTE_ENGINE images --format '{{.CreatedAt}} {{.Repository}}:{{.Tag}} {{.ID}}' | \
-      awk '\$2 ~ /(^|\/)local\/${APP}:/ {print}' | \
+    ${REMOTE_ENGINE} images --format '{{.CreatedAt}} {{.Repository}}:{{.Tag}} {{.ID}}' | \
+      awk '\$2 ~ /(^|\\/)local\\/${APP}:/ {print}' | \
       sort -r | \
       awk 'NR>${KEEP_IMAGES} {print \$3}' | \
       while read -r id; do
-        if [[ -n \"\$CUR_ID\" && \"\$id\" == \"\$CUR_ID\" ]]; then continue; fi
-        if [[ -n \"\$OLD_ID\" && \"\$id\" == \"\$OLD_ID\" ]]; then continue; fi
-        if ! $REMOTE_ENGINE ps -a --format '{{.ImageID}}' | grep -q \"^\$id$\"; then
-          $REMOTE_ENGINE rmi -f \"\$id\" >/dev/null 2>&1 || true
+        [[ -n \"\$CUR_ID\" && \"\$id\" == \"\$CUR_ID\" ]] && continue
+        [[ -n \"\$OLD_ID\" && \"\$id\" == \"\$OLD_ID\" ]] && continue
+        if ! ${REMOTE_ENGINE} ps -a --format '{{.ImageID}}' | grep -q \"^\$id$\"; then
+          ${REMOTE_ENGINE} rmi -f \"\$id\" >/dev/null 2>&1 || true
         fi
       done
   "
@@ -548,16 +577,16 @@ fi
 
 echo
 echo "==> DONE"
-echo "Remote app dir: $REMOTE_APP_DIR"
+echo "Remote app dir: ${REMOTE_APP_DIR}"
 echo "Archive:        $(basename "$REMOTE_ARCHIVE")"
-echo "Image ref:      $LOADED_REF"
-echo "Container:      $CONTAINER_NAME"
+echo "Image ref:      ${LOADED_REF}"
+echo "Container:      ${CONTAINER_NAME}"
 echo "Port mapping:   ${PORT_HOST} -> ${PORT_CONT}"
+echo "Remote rootless: ${REMOTE_ROOTLESS}"
+echo "Systemd scope:   ${EFFECTIVE_SCOPE}"
 if [[ -n "$ENV_FILE" ]]; then
-  echo "Env file:       $ENV_FILE"
+  echo "Env file:       ${ENV_FILE}"
 fi
-echo "Remote rootless: $REMOTE_ROOTLESS"
-echo "Systemd scope:   $EFFECTIVE_SCOPE"
 if [[ "$DRY_RUN" == "true" ]]; then
-  echo "NOTE: dry-run mode was enabled; no changes were made."
+  echo "NOTE: dry-run mode enabled; no changes were made."
 fi
