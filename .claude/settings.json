@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install)",
+      "Bash(npm run build -w shared)",
+      "Bash(npm run build -w server)",
+      "Bash(npm run build -w client)",
+      "Bash(npm run build)"
+    ]
+  }
+}

@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: #111111;
+    --foreground: #ffffff;
+    --primary: #e20074;
+    --primary-dark: #b5005b;
+    --border: #2e2e2e;
+    --muted: #666666;
+    --input: #242424;
+  }
+
+  body {
+    @apply bg-surface-900 text-white font-sans antialiased;
+  }
+
+  * {
+    @apply border-surface-600;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-surface-950;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-surface-600 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-magenta;
+  }
+
+  /* Focus ring with magenta */
+  *:focus-visible {
+    @apply outline-none ring-2 ring-magenta ring-offset-2 ring-offset-surface-900;
+  }
+}
+
+@layer components {
+  .input-base {
+    @apply w-full bg-surface-700 border border-surface-600 rounded-md px-3 py-2
+           text-sm text-white placeholder-surface-400
+           focus:outline-none focus:border-magenta focus:ring-1 focus:ring-magenta
+           transition-colors;
+  }
+
+  .label-base {
+    @apply block text-xs font-medium text-surface-200 mb-1.5;
+  }
+
+  .btn-primary {
+    @apply bg-magenta hover:bg-magenta-dark disabled:opacity-50 disabled:cursor-not-allowed
+           text-white font-semibold py-2 px-4 rounded-md transition-colors text-sm;
+  }
+
+  .btn-secondary {
+    @apply bg-surface-700 hover:bg-surface-600 border border-surface-600
+           text-white font-medium py-2 px-4 rounded-md transition-colors text-sm;
+  }
+
+  .btn-ghost {
+    @apply text-surface-200 hover:text-white hover:bg-surface-800
+           font-medium py-1.5 px-3 rounded-md transition-colors text-sm;
+  }
+
+  .card {
+    @apply bg-surface-800 border border-surface-600 rounded-lg;
+  }
+
+  .section-header {
+    @apply flex items-center justify-between w-full py-3 px-4
+           text-sm font-medium text-surface-200 hover:text-white
+           transition-colors cursor-pointer;
+  }
+}
