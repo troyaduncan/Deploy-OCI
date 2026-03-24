@@ -64,11 +64,12 @@ const defaults: DeployFormValues = {
 interface DeployFormProps {
   onSubmit: (config: DeploymentConfig) => void;
   isDeploying: boolean;
+  initialConfig?: Partial<DeploymentConfig>;
 }
 
-export function DeployForm({ onSubmit, isDeploying }: DeployFormProps) {
+export function DeployForm({ onSubmit, isDeploying, initialConfig }: DeployFormProps) {
   const form = useForm<DeployFormValues>({
-    defaultValues: defaults,
+    defaultValues: initialConfig ? { ...defaults, ...initialConfig } : defaults,
     resolver: zodResolver(schema),
   });
 

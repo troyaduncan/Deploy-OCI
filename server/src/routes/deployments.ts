@@ -1,6 +1,9 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { z } from "zod";
+import fs from "fs";
+import path from "path";
+import os from "os";
 import {
   startDeployment,
   cancelDeployment,
@@ -38,6 +41,14 @@ const DeploymentConfigSchema = z.object({
   keepImages: z.number().int().min(0).default(3),
 });
 
+// Resolve ~ to the real home directory
+function expandHome(p: string): string {
+  if (p.startsWith("~/") || p === "~") {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
+
 // POST /api/deployments — start a new deployment
 router.post("/", (req: Request, res: Response) => {
   const result = DeploymentConfigSchema.safeParse(req.body);
@@ -45,6 +56,15 @@ router.post("/", (req: Request, res: Response) => {
     res.status(400).json({
       error: "Invalid configuration",
       details: result.error.flatten(),
+    });
+    return;
+  }
+
+  const { app, projectsDir } = result.data;
+  const localAppDir = path.join(expandHome(projectsDir), app);
+  if (!fs.existsSync(localAppDir)) {
+    res.status(400).json({
+      error: `Local app directory not found: ${localAppDir}`,
     });
     return;
   }

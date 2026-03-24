@@ -6,7 +6,15 @@ async function fetchJson<T>(
   url: string,
   init?: RequestInit
 ): Promise<T> {
-  const res = await fetch(url, init);
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch {
+    throw new Error(
+      "Cannot reach the API server. Make sure you ran `npm run dev` (not just the client). " +
+        "The Express server must be running on port 3001."
+    );
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`);

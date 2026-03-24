@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
-import { Eye, Trash2, ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { Eye, Trash2, ChevronLeft, ChevronRight, RefreshCw, RotateCcw } from "lucide-react";
 import type { DeploymentRecord } from "@deploy-oci/shared";
 import { api } from "../../lib/api.ts";
 import { StatusBadge } from "./StatusBadge.tsx";
@@ -7,6 +8,7 @@ import { LogModal } from "./LogModal.tsx";
 import { formatDuration, formatRelativeTime } from "../../lib/utils.ts";
 
 export function HistoryTable() {
+  const navigate = useNavigate();
   const [records, setRecords] = useState<DeploymentRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -181,6 +183,16 @@ export function HistoryTable() {
                         title="View logs"
                       >
                         <Eye size={14} />
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          navigate("/deploy", { state: { config: record.config } });
+                        }}
+                        className="p-1.5 rounded text-surface-400 hover:text-magenta hover:bg-surface-700 transition-colors"
+                        title="Rerun with same config"
+                      >
+                        <RotateCcw size={14} />
                       </button>
                       <button
                         onClick={(e) => handleDelete(record.id, e)}

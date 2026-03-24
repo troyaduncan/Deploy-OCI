@@ -257,6 +257,24 @@ The web app wraps `deploy-oci.sh`. You can still use it directly from the comman
 - `set -euo pipefail` — fails immediately on any error
 - Rollback uses existing image in remote store — no re-transfer needed
 - SSH keepalives prevent connection drops during large transfers
+- Systemd units are stopped/disabled before container removal (prevents race condition where systemd restarts the container between `podman rm` and the new `podman run`)
+- Podman builds use `--network=host` for reliable DNS resolution in rootless mode
+
+### Air-Gapped / Corporate Environment Notes
+
+**CA Certificate Injection**: For environments behind corporate TLS inspection proxies, Containerfiles should inject the CA bundle before any network calls (e.g., `npm install`, `pnpm install`):
+
+```dockerfile
+COPY deploy/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+```
+
+Place your corporate CA bundle at `<app>/deploy/ca-certificates.crt`. The system CA bundle from `/etc/ssl/certs/ca-certificates.crt` on your build machine typically works.
+
+**Env File Format**: Podman's `--env-file` is strict — no comments, no blank lines, only `KEY=VALUE` lines.
+
+**Systemd + Env Files**: When using `--use-systemd`, the generated systemd unit does not include `--env-file`. After the initial deploy sets up systemd, subsequent restarts via systemd will run without env vars unless you regenerate the unit. To work around this, redeploy with `--use-systemd` after updating the env file.
 
 ### Exit Codes
 

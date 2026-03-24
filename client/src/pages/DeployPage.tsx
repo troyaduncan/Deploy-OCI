@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { DeployForm } from "../components/deploy/DeployForm.tsx";
 import { PipelineProgress } from "../components/pipeline/PipelineProgress.tsx";
 import { DeploymentLog } from "../components/log/DeploymentLog.tsx";
@@ -30,16 +30,20 @@ interface LogEntry {
 
 export function DeployPage() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const rerunConfig = (location.state as { config?: DeploymentConfig } | null)?.config;
   const [steps, setSteps] = useState<PipelineStep[]>(INITIAL_STEPS);
   const [logLines, setLogLines] = useState<LogEntry[]>([]);
   const [deployStatus, setDeployStatus] = useState<DeployStatus>("idle");
   const [currentDeployId, setCurrentDeployId] = useState<string | null>(null);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
 
   const resetState = useCallback(() => {
     setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: "pending" as const })));
     setLogLines([]);
     setDeployStatus("idle");
     setCurrentDeployId(null);
+    setPreflightError(null);
   }, []);
 
   const handleDeploy = useCallback(async (config: DeploymentConfig) => {
@@ -52,14 +56,9 @@ export function DeployPage() {
       id = result.id;
       setCurrentDeployId(id);
     } catch (err) {
-      setDeployStatus("failed");
-      setLogLines([
-        {
-          line: `ERROR: Failed to start deployment: ${err instanceof Error ? err.message : String(err)}`,
-          stream: "stderr",
-          timestamp: new Date().toISOString(),
-        },
-      ]);
+      const msg = err instanceof Error ? err.message : String(err);
+      setDeployStatus("idle");
+      setPreflightError(msg);
       return;
     }
 
@@ -149,6 +148,20 @@ export function DeployPage() {
         </div>
       </div>
 
+      {/* Pre-flight error banner */}
+      {preflightError && (
+        <div className="mx-6 mt-4 flex items-start gap-3 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 text-sm flex-shrink-0">
+          <span className="font-bold flex-shrink-0 mt-0.5">✗</span>
+          <span className="font-mono text-xs leading-relaxed">{preflightError}</span>
+          <button
+            onClick={() => setPreflightError(null)}
+            className="ml-auto flex-shrink-0 text-red-400 hover:text-red-200 text-base leading-none"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       <div className="flex-1 flex overflow-hidden min-h-0">
         {/* Left panel: Form */}
         <div
@@ -157,7 +170,7 @@ export function DeployPage() {
             deployStatus === "running" && "pointer-events-none opacity-60"
           )}
         >
-          <DeployForm onSubmit={handleDeploy} isDeploying={deployStatus === "running"} />
+          <DeployForm onSubmit={handleDeploy} isDeploying={deployStatus === "running"} initialConfig={rerunConfig} />
         </div>
 
         {/* Right panel: Pipeline + Log */}

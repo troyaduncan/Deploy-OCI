@@ -1,4 +1,15 @@
 import type { DeploymentConfig } from "@deploy-oci/shared";
+import os from "os";
+import path from "path";
+
+// spawn() does not go through a shell, so ~ is never expanded.
+// Expand it here so deploy-oci.sh receives an absolute path.
+function expandHome(p: string): string {
+  if (p === "~" || p.startsWith("~/")) {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
 
 // Converts DeploymentConfig into CLI args array for deploy-oci.sh
 export function buildScriptArgs(config: DeploymentConfig): string[] {
@@ -13,7 +24,7 @@ export function buildScriptArgs(config: DeploymentConfig): string[] {
   push("--ssh-port", config.sshPort);
   push("--ssh-keepalive", config.sshKeepalive);
   push("--ssh-keepalive-count", config.sshKeepaliveCount);
-  push("--projects-dir", config.projectsDir);
+  push("--projects-dir", expandHome(config.projectsDir));
 
   if (config.remoteDir) push("--remote-dir", config.remoteDir);
   if (config.port) push("--port", config.port);
